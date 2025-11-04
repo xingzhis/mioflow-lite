@@ -1,3 +1,12 @@
+"""
+TODO:
+1. per-time-point loss weights
+2. deprecate local training
+3. add weight initialization
+4. test on gpu
+5. test different activation functions
+""" 
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
