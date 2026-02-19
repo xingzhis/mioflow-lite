@@ -20,13 +20,16 @@ from tqdm import tqdm
 from typing import List, Dict, Tuple
 
 class ODEFunc(nn.Module):
-    def __init__(self, input_dim, hidden_dim, momentum_beta=0.0):
+    def __init__(self, input_dim, hidden_dim, momentum_beta=0.0, condition_dims=0):
         super().__init__()
         self.momentum_beta = momentum_beta
         self.previous_v = None
+        self.condition_dims = condition_dims
+        self.condition = None
         
+        # Network input: input_dim + time + condition_dims
         self.model = nn.Sequential(
-            nn.Linear(input_dim + 1, hidden_dim), # additional dim for time t.
+            nn.Linear(input_dim + 1 + condition_dims, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -46,12 +49,19 @@ class ODEFunc(nn.Module):
     def reset_momentum(self):
         """Reset momentum state before integration"""
         self.previous_v = None
+    
+    def set_condition(self, condition):
+        """Set condition for conditional ODE"""
+        self.condition = condition
 
     def forward(self, t, x):
         # t is scalar, x is [batch_size, input_dim]
         # Expand t to [batch_size, 1] to match x's batch dimension
         t_expanded = t.expand(x.size(0), 1)
-        input = torch.cat([t_expanded, x], dim=-1)
+        if self.condition_dims > 0:
+            input = torch.cat([t_expanded, x, self.condition], dim=-1)
+        else:
+            input = torch.cat([t_expanded, x], dim=-1)
         dxdt = self.model(input)
         
         # Apply momentum if enabled
@@ -72,16 +82,19 @@ class SDEFunc(nn.Module):
     noise_type = 'diagonal'
     sde_type = 'ito'
     
-    def __init__(self, input_dim, hidden_dim, diffusion_scale=0.1, diffusion_init_scale=0.1, momentum_beta=0.0):
+    def __init__(self, input_dim, hidden_dim, diffusion_scale=0.1, diffusion_init_scale=0.1, momentum_beta=0.0, condition_dims=0):
         super().__init__()
         self.diffusion_scale = diffusion_scale
         self.diffusion_init_scale = diffusion_init_scale
         self.momentum_beta = momentum_beta
         self.previous_v = None
+        self.condition_dims = condition_dims
+        self.condition = None
         
         # Drift network (same complexity as ODEFunc)
+        # Network input: input_dim + time + condition_dims
         self.drift_net = nn.Sequential(
-            nn.Linear(input_dim + 1, hidden_dim),
+            nn.Linear(input_dim + 1 + condition_dims, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -91,7 +104,7 @@ class SDEFunc(nn.Module):
         # Diffusion network (simpler: 1 hidden layer)
         # Softplus ensures positive diffusion: g ∈ [0, ∞)
         self.diffusion_net = nn.Sequential(
-            nn.Linear(input_dim + 1, hidden_dim),
+            nn.Linear(input_dim + 1 + condition_dims, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, input_dim),
             nn.Softplus(),
@@ -122,10 +135,17 @@ class SDEFunc(nn.Module):
         """Reset momentum state before integration"""
         self.previous_v = None
     
+    def set_condition(self, condition):
+        """Set condition for conditional SDE"""
+        self.condition = condition
+    
     def f(self, t, x):
         """Drift term"""
         t_expanded = t.expand(x.size(0), 1)
-        input = torch.cat([t_expanded, x], dim=-1)
+        if self.condition_dims > 0:
+            input = torch.cat([t_expanded, x, self.condition], dim=-1)
+        else:
+            input = torch.cat([t_expanded, x], dim=-1)
         drift = self.drift_net(input)
         
         # Apply momentum if enabled
@@ -140,14 +160,46 @@ class SDEFunc(nn.Module):
     def g(self, t, x):
         """Diffusion term - scaled by diffusion_scale"""
         t_expanded = t.expand(x.size(0), 1)
-        input = torch.cat([t_expanded, x], dim=-1)
+        if self.condition_dims > 0:
+            input = torch.cat([t_expanded, x, self.condition], dim=-1)
+        else:
+            input = torch.cat([t_expanded, x], dim=-1)
         return self.diffusion_scale * self.diffusion_net(input)
 
-def ot_loss(source, target):
+def ot_loss(source, target, return_plan=False):
+    """Optimal transport loss with optional plan return"""
     mu = torch.tensor(ot.unif(source.size()[0]), dtype=source.dtype, device=source.device)
     nu = torch.tensor(ot.unif(target.size()[0]), dtype=target.dtype, device=target.device)
     M = torch.cdist(source, target)**2
-    return ot.emd2(mu, nu, M)
+    if return_plan:
+        plan = ot.emd(mu, nu, M)
+        plan = torch.from_numpy(plan).to(source.device) if isinstance(plan, np.ndarray) else plan
+        loss = torch.sum(plan * M)
+        return loss, plan
+    else:
+        return ot.emd2(mu, nu, M)
+
+def ot_loss_given_plan(plan, source, target):
+    """Compute OT loss given a transport plan"""
+    M = torch.cdist(source, target)**2
+    return torch.sum(plan * M)
+
+def extract_condition(data, condition_dims):
+    """Extract features and conditions from data
+    
+    Args:
+        data: [batch, features + conditions]
+        condition_dims: Number of condition dimensions
+    
+    Returns:
+        features: [batch, features]
+        condition: [batch, conditions] or None
+    """
+    if condition_dims == 0:
+        return data, None
+    features = data[:, :-condition_dims]
+    condition = data[:, -condition_dims:]
+    return features, condition
 
 def energy_loss(model, x0, t_seq, is_sde=False, dt=0.1, lambda_f=1.0, lambda_g=0.0):
     """
@@ -219,7 +271,7 @@ def infer(x0, model, t_seq, dt=0.1):
     Run inference with ODE or SDE model.
     
     Args:
-        x0: Initial condition [batch_size, input_dim]
+        x0: Initial condition [batch_size, input_dim] or [batch_size, input_dim + condition_dim]
         model: ODEFunc or SDEFunc
         t_seq: Time sequence tensor
         dt: Time step for SDE integration (ignored for ODE)
@@ -227,14 +279,21 @@ def infer(x0, model, t_seq, dt=0.1):
     Returns:
         Trajectory [time_steps, batch_size, input_dim]
     """
+    # Extract features and conditions
+    features, condition = extract_condition(x0, model.condition_dims)
+    
+    # Set condition if model is conditional
+    if model.condition_dims > 0:
+        model.set_condition(condition)
+    
     # Reset momentum before integration
     model.reset_momentum()
     
     is_sde = hasattr(model, 'f') and hasattr(model, 'g')
     if is_sde:
-        return torchsde.sdeint_adjoint(model, x0, t_seq, dt=dt, method='euler')
+        return torchsde.sdeint_adjoint(model, features, t_seq, dt=dt, method='euler')
     else:
-        return odeint(model, x0, t_seq)
+        return odeint(model, features, t_seq)
 
 
 class TimeSeriesDataset(Dataset):
@@ -378,13 +437,21 @@ def train_mioflow(
                 X_start = X_start[indices]
                 X_end = X_end[indices]
 
-            # Integrate from X_start to predict X_end
+            # Extract features and conditions
+            features_start, condition_start = extract_condition(X_start, model.condition_dims)
+            features_end, condition_end = extract_condition(X_end, model.condition_dims)
+            
+            # Set condition if model is conditional
+            if model.condition_dims > 0:
+                model.set_condition(condition_start)
+
+            # Integrate from features_start to predict features_end
             model.reset_momentum()
             t_interval = torch.tensor([t_start, t_end], device=device, dtype=torch.float32)
             if is_sde:
-                X_pred = torchsde.sdeint_adjoint(model, X_start, t_interval, dt=sde_dt, method='euler')[1]
+                features_pred = torchsde.sdeint_adjoint(model, features_start, t_interval, dt=sde_dt, method='euler')[1]
             else:
-                X_pred = odeint(model, X_start, t_interval)[1]
+                features_pred = odeint(model, features_start, t_interval)[1]
 
             # Compute losses (only when weights are non-zero)
             total_loss = 0.0
@@ -393,17 +460,23 @@ def train_mioflow(
             energy_loss_val = torch.tensor(0.0, device=device)
 
             if lambda_ot > 0:
-                ot_loss_val = ot_loss(X_pred, X_end)
-                total_loss += lambda_ot * ot_loss_val
+                if model.condition_dims > 0:
+                    # For conditional models, use OT loss with plan and add condition consistency loss
+                    ot_loss_val, plan = ot_loss(features_pred, features_end, return_plan=True)
+                    cond_loss_val = ot_loss_given_plan(plan, condition_start, condition_end)
+                    total_loss += lambda_ot * ot_loss_val + cond_loss_val
+                else:
+                    ot_loss_val = ot_loss(features_pred, features_end)
+                    total_loss += lambda_ot * ot_loss_val
 
             if lambda_density > 0:
-                density_loss_val = density_loss(X_pred, X_end)
+                density_loss_val = density_loss(features_pred, features_end)
                 total_loss += lambda_density * density_loss_val
 
             if lambda_energy > 0:
                 # Create denser time grid for energy loss
                 energy_t_seq = torch.linspace(t_start, t_end, energy_time_steps, device=device, dtype=torch.float32)
-                energy_loss_val = energy_loss(model, X_start, energy_t_seq, is_sde=is_sde, dt=sde_dt, 
+                energy_loss_val = energy_loss(model, features_start, energy_t_seq, is_sde=is_sde, dt=sde_dt, 
                                              lambda_f=lambda_energy_f, lambda_g=lambda_energy_g)
                 total_loss += lambda_energy * energy_loss_val
 
