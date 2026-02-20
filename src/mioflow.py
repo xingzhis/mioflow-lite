@@ -143,11 +143,68 @@ class SDEFunc(nn.Module):
         input = torch.cat([t_expanded, x], dim=-1)
         return self.diffusion_scale * self.diffusion_net(input)
 
-def ot_loss(source, target):
-    mu = torch.tensor(ot.unif(source.size()[0]), dtype=source.dtype, device=source.device)
-    nu = torch.tensor(ot.unif(target.size()[0]), dtype=target.dtype, device=target.device)
+class GrowthRateModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=32, use_time=True):
+        super().__init__()
+        self.use_time = use_time
+        # Add 1 to input_dim if we are using time
+        actual_input_dim = input_dim + 1 if use_time else input_dim
+        
+        self.net = nn.Sequential(
+            nn.Linear(actual_input_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.softplus = nn.Softplus()
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # Initialize last layer bias to 0.5413 so initial mass is approx 1.0 (Softplus(0.5413) ~ 1.0)
+        # and weights to 0
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, 0.5413)
+
+    def forward(self, x, t=None):
+        if self.use_time:
+            if t is None:
+                raise ValueError("t must be provided if use_time is True")
+            # Expand scalar t or vector t to match x batch size
+            if t.dim() == 0:
+                t_expanded = t.expand(x.size(0), 1)
+            elif t.dim() == 1 and t.size(0) == 1:
+                t_expanded = t.expand(x.size(0), 1)
+            else:
+                t_expanded = t.view(-1, 1)
+            input_feats = torch.cat([x, t_expanded], dim=-1)
+        else:
+            input_feats = x
+            
+        # Mass = Softplus(net(input_feats)) + 1e-4 to ensure strict positivity
+        out = self.net(input_feats)
+        return self.softplus(out).squeeze(-1) + 1e-4
+
+
+def ot_loss(source, target, source_mass=None, target_mass=None, reg=0.1):
+    use_sinkhorn = source_mass is not None or target_mass is not None
     M = torch.cdist(source, target)**2
-    return ot.emd2(mu, nu, M)
+    
+    if use_sinkhorn:
+        # Standardize mass to sum to 1.0 for balanced OT
+        mu = source_mass / source_mass.sum()
+        nu = torch.tensor(ot.unif(target.size(0)), dtype=target.dtype, device=target.device)
+        
+        # Use exact EMD for mathematically sound and perfectly stable spatial gradients
+        # We detach the mass inputs so the ODE solver only sees the spatial vector field gradients,
+        # perfectly preventing underflows and trajectory mode collapse!
+        loss = ot.emd2(mu.detach(), nu.detach(), M)
+        return loss
+    else:
+        # Standard balanced uniform EMD for regular MIOFlow
+        mu = torch.tensor(ot.unif(source.size(0)), dtype=source.dtype, device=source.device)
+        nu = torch.tensor(ot.unif(target.size(0)), dtype=target.dtype, device=target.device)
+        return ot.emd2(mu, nu, M)
 
 def energy_loss(model, x0, t_seq, is_sde=False, dt=0.1, lambda_f=1.0, lambda_g=0.0):
     """
@@ -280,6 +337,87 @@ class TimeSeriesDataset(Dataset):
         return torch.tensor(X_0, dtype=torch.float32)
 
 
+def compute_uot_growth_rates(dataset: TimeSeriesDataset, reg_m=[1.0, 100.0], div='l2'):
+    """
+    Computes Unbalanced Optimal Transport (UOT) mass for each point in the dataset 
+    by solving sequential UOT problems between timepoints.
+    
+    A lower reg_m (e.g., 1.0) allows MASSIVE destruction of points, creating huge variance.
+    
+    Returns a list of 1D tensors, where each tensor contains the target mass 
+    for the points at the corresponding time index.
+    """
+    growth_rates = []
+    
+    for i in range(len(dataset)):
+        batch = dataset[i]
+        x0 = batch['X_start'].cpu().numpy()
+        x1 = batch['X_end'].cpu().numpy()
+        
+        m, n = ot.unif(len(x0)), ot.unif(len(x1))
+        M = ot.dist(x0, x1)
+        plan = ot.unbalanced.mm_unbalanced(m, n, M, reg_m, div=div)
+        
+        gr = plan.sum(axis=1) * plan.shape[0]
+        growth_rates.append(torch.tensor(gr, dtype=torch.float32))
+        
+    return growth_rates
+
+def pretrain_growth_model(
+    model: GrowthRateModel, 
+    dataset: TimeSeriesDataset, 
+    uot_masses: List[torch.Tensor], 
+    num_epochs: int = 50, 
+    learning_rate: float = 1e-3, 
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+):
+    """
+    Pretrains the GrowthRateModel using MSE loss to match the UOT computed masses.
+    """
+    model = model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = nn.MSELoss()
+    
+    model.train()
+    
+    all_x = []
+    all_t = []
+    all_target_mass = []
+    for i in range(len(dataset)):
+        batch = dataset[i]
+        all_x.append(batch['X_start'])
+        t_start = batch['t_start']
+        all_t.append(torch.full((batch['X_start'].size(0), 1), t_start, dtype=torch.float32))
+        all_target_mass.append(uot_masses[i])
+        
+        # Explicitly anchor the final timepoint!
+        if i == len(dataset) - 1:
+            all_x.append(batch['X_end'])
+            t_end = batch['t_end']
+            all_t.append(torch.full((batch['X_end'].size(0), 1), t_end, dtype=torch.float32))
+            all_target_mass.append(torch.ones(batch['X_end'].size(0), dtype=torch.float32))
+        
+    all_x = torch.cat(all_x, dim=0).to(device)
+    all_t = torch.cat(all_t, dim=0).to(device)
+    all_target_mass = torch.cat(all_target_mass, dim=0).to(device)
+    
+    pbar = tqdm(range(num_epochs), desc='Pre-training Growth Model')
+    for epoch in pbar:
+        optimizer.zero_grad()
+        
+        if getattr(model, 'use_time', False):
+            predicted_mass = model(all_x, all_t)
+        else:
+            predicted_mass = model(all_x)
+            
+        loss = criterion(predicted_mass, all_target_mass)
+        
+        loss.backward()
+        optimizer.step()
+        
+        pbar.set_postfix({'MSE': f'{loss.item():.4f}'})
+
+
 def train_mioflow(
     model,
     dataset: TimeSeriesDataset,
@@ -299,7 +437,10 @@ def train_mioflow(
     scheduler_step_size: int = 30,  # For StepLR
     scheduler_gamma: float = 0.5,  # Decay factor for schedulers
     scheduler_t_max: int = None,  # For CosineAnnealingLR, defaults to num_epochs
-    scheduler_min_lr: float = 0.0  # Minimum learning rate for cosine scheduler
+    scheduler_min_lr: float = 0.0,  # Minimum learning rate for cosine scheduler
+    growth_rate_model = None,  # Growth rate model
+    growth_rate_lr: float = 1e-4,  # Learning rate for growth rate model
+    lambda_growth_l1: float = 0.0  # L1 penalty pushing growth rate towards 1.0
 ) -> Dict:
     """
     Train MIOFlow model with ODE or SDE.
@@ -324,6 +465,9 @@ def train_mioflow(
         scheduler_gamma: Decay factor for schedulers
         scheduler_t_max: Maximum number of iterations for CosineAnnealingLR (defaults to num_epochs)
         scheduler_min_lr: Minimum learning rate for cosine scheduler (default 0.0)
+        growth_rate_model: Optional GrowthRateModel instance
+        growth_rate_lr: Learning rate for growth_rate_model parameters
+        lambda_growth_l1: L1 regularization weight to push mass towards 1.0
 
     Returns:
         Training history
@@ -333,8 +477,16 @@ def train_mioflow(
         Recommended: lambda_energy_f=1.0, lambda_energy_g=0.0 (only penalize drift)
     """
     model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
+    if growth_rate_model is not None:
+        growth_rate_model = growth_rate_model.to(device)
+        optimizer = optim.Adam([
+            {'params': model.parameters(), 'lr': learning_rate},
+            {'params': growth_rate_model.parameters(), 'lr': growth_rate_lr}
+        ])
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        
     # Detect if model is SDE
     is_sde = hasattr(model, 'f') and hasattr(model, 'g')
 
@@ -393,9 +545,21 @@ def train_mioflow(
             energy_loss_val = torch.tensor(0.0, device=device)
 
             if lambda_ot > 0:
-                ot_loss_val = ot_loss(X_pred, X_end)
+                source_mass = None
+                if growth_rate_model is not None:
+                    if getattr(growth_rate_model, 'use_time', False):
+                        t_tensor = torch.tensor([t_start], device=device, dtype=torch.float32)
+                        source_mass = growth_rate_model(X_start, t_tensor)
+                    else:
+                        source_mass = growth_rate_model(X_start)
+                
+                ot_loss_val = ot_loss(X_pred, X_end, source_mass=source_mass)
                 total_loss += lambda_ot * ot_loss_val
-
+                
+                if lambda_growth_l1 > 0 and source_mass is not None:
+                    l1_penalty = torch.mean(torch.abs(source_mass - 1.0))
+                    total_loss += lambda_growth_l1 * l1_penalty
+                    
             if lambda_density > 0:
                 density_loss_val = density_loss(X_pred, X_end)
                 total_loss += lambda_density * density_loss_val
