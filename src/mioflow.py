@@ -439,8 +439,7 @@ def train_mioflow(
     scheduler_t_max: int = None,  # For CosineAnnealingLR, defaults to num_epochs
     scheduler_min_lr: float = 0.0,  # Minimum learning rate for cosine scheduler
     growth_rate_model = None,  # Growth rate model
-    growth_rate_lr: float = 1e-4,  # Learning rate for growth rate model
-    lambda_growth_l1: float = 0.0  # L1 penalty pushing growth rate towards 1.0
+    growth_rate_lr: float = 1e-4  # Learning rate for growth rate model
 ) -> Dict:
     """
     Train MIOFlow model with ODE or SDE.
@@ -467,7 +466,6 @@ def train_mioflow(
         scheduler_min_lr: Minimum learning rate for cosine scheduler (default 0.0)
         growth_rate_model: Optional GrowthRateModel instance
         growth_rate_lr: Learning rate for growth_rate_model parameters
-        lambda_growth_l1: L1 regularization weight to push mass towards 1.0
 
     Returns:
         Training history
@@ -555,10 +553,6 @@ def train_mioflow(
                 
                 ot_loss_val = ot_loss(X_pred, X_end, source_mass=source_mass)
                 total_loss += lambda_ot * ot_loss_val
-                
-                if lambda_growth_l1 > 0 and source_mass is not None:
-                    l1_penalty = torch.mean(torch.abs(source_mass - 1.0))
-                    total_loss += lambda_growth_l1 * l1_penalty
                     
             if lambda_density > 0:
                 density_loss_val = density_loss(X_pred, X_end)
