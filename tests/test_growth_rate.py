@@ -71,7 +71,16 @@ def main():
         raise
     
     print("2. Pre-training the GrowthRateModel to predict UOT masses...")
-    pretrain_growth_model(growth_model, dataset, uot_masses, num_epochs=150, learning_rate=1e-3, device=device)
+    pretrain_growth_model(
+        growth_model, 
+        dataset, 
+        uot_masses, 
+        num_epochs=150, 
+        learning_rate=1e-3, 
+        device=device,
+        scheduler_type='cosine',
+        scheduler_min_lr=1e-5
+    )
     
     print("3. Training MIOFlow with pre-trained Growth Rate concurrently...")
     history = train_mioflow(
@@ -82,11 +91,13 @@ def main():
         learning_rate=1e-3,
         device=device,
         lambda_ot=1.0,
-        lambda_density=0.01,
-        lambda_energy=0.2,  # Reduced from 2.0 to allow trajectories to complete
+        lambda_density=0.00,
+        lambda_energy=0.3,  # Reduced from 2.0 to allow trajectories to complete
         energy_time_steps=10,
         growth_rate_model=growth_model,
-        growth_rate_lr=0.0  # Explicitly freeze the pre-trained growth model
+        growth_rate_lr=1e-5,  # Unfreeze the pre-trained growth model with a small LR
+        scheduler_type='cosine',
+        scheduler_min_lr=1e-6
     )
     
     final_losses = get_final_losses(history)
@@ -121,7 +132,6 @@ def main():
     # Calculate predicted mass at start
     with torch.no_grad():
         t_0_sample = torch.zeros(X_0_sample.shape[0], 1, dtype=torch.float32, device=device)
-        initial_mass = growth_model(X_0_sample, t_0_sample).cpu().numpy()
         trajectories = infer(x0=X_0_sample, model=ode_model, t_seq=t_bins) 
         trajectories = trajectories.permute(1, 0, 2)
         

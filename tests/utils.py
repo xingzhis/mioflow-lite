@@ -83,3 +83,29 @@ def make_blob_death_example(n_pts_per_bin=100, seed=42):
     
     df = pd.concat([df_tp0, df_tp1, df_tp2], ignore_index=True)
     return df
+
+def make_drastic_dying_example(n_pts_per_bin=50, seed=42):
+    """
+    Creates a drastically separated dataset where the bottom branch is far away.
+    Top branch: y=0. Bottom branch: y=15 (dies after t=2).
+    """
+    import numpy as np
+    import pandas as pd
+    np.random.seed(seed)
+    data = []
+    
+    for t in range(5):
+        # Top branch
+        x_top = np.random.normal(t * 2, 0.4, n_pts_per_bin)
+        y_top = np.random.normal(0, 0.4, n_pts_per_bin)
+        for i in range(n_pts_per_bin):
+            data.append({'d1': x_top[i], 'd2': y_top[i], 'samples': str(t)})
+            
+        # Bottom branch
+        if t <= 2:
+            x_bottom = np.random.normal(t * 2, 0.4, n_pts_per_bin)
+            y_bottom = np.random.normal(15, 0.4, n_pts_per_bin)
+            for i in range(n_pts_per_bin):
+                data.append({'d1': x_bottom[i], 'd2': y_bottom[i], 'samples': str(t)})
+                
+    return pd.DataFrame(data, columns=['d1', 'd2', 'samples'])

@@ -188,19 +188,29 @@ class GrowthRateModel(nn.Module):
 
 def ot_loss(source, target, source_mass=None, target_mass=None, reg=0.1):
     use_sinkhorn = source_mass is not None or target_mass is not None
-    M = torch.cdist(source, target)**2
     
     if use_sinkhorn:
+        # Mask out explicitly dead points so they don't get forced into the balanced EMD matching
+        mask_threshold = 0.05
+        mask = source_mass > mask_threshold
+        
+        if not mask.any():
+            # If all points in the batch are dead, no OT cost to transport them
+            return torch.tensor(0.0, device=source.device, requires_grad=True)
+            
+        active_source = source[mask]
+        active_mass = source_mass[mask]
+        M = torch.cdist(active_source, target)**2
+
         # Standardize mass to sum to 1.0 for balanced OT
-        mu = source_mass / source_mass.sum()
+        mu = active_mass / active_mass.sum()
         nu = torch.tensor(ot.unif(target.size(0)), dtype=target.dtype, device=target.device)
         
-        # Use exact EMD for mathematically sound and perfectly stable spatial gradients
-        # We detach the mass inputs so the ODE solver only sees the spatial vector field gradients,
-        # perfectly preventing underflows and trajectory mode collapse!
+        # We detach the mass inputs so the ODE solver only sees the spatial vector field gradients
         loss = ot.emd2(mu.detach(), nu.detach(), M)
         return loss
     else:
+        M = torch.cdist(source, target)**2
         # Standard balanced uniform EMD for regular MIOFlow
         mu = torch.tensor(ot.unif(source.size(0)), dtype=source.dtype, device=source.device)
         nu = torch.tensor(ot.unif(target.size(0)), dtype=target.dtype, device=target.device)
@@ -260,12 +270,21 @@ def energy_loss(model, x0, t_seq, is_sde=False, dt=0.1, lambda_f=1.0, lambda_g=0
 
     return total_energy / num_evaluations
 
-def density_loss(source, target, top_k=5, hinge_value=0.01):
+def density_loss(source, target, source_mass=None, top_k=5, hinge_value=0.01):
     """
     Density loss that encourages points to be close to target distribution.
     Uses hinge loss on k-nearest neighbor distances.
+    Masks out points that have mass <= 0.05.
     """
-    c_dist = torch.cdist(source, target)
+    if source_mass is not None:
+        mask = source_mass > 0.05
+        if not mask.any():
+            return torch.tensor(0.0, device=source.device, requires_grad=True)
+        active_source = source[mask]
+    else:
+        active_source = source
+        
+    c_dist = torch.cdist(active_source, target)
     values, _ = torch.topk(c_dist, top_k, dim=1, largest=False, sorted=False)
     values = torch.clamp(values - hinge_value, min=0.0)
     return torch.mean(values)
@@ -366,16 +385,32 @@ def compute_uot_growth_rates(dataset: TimeSeriesDataset, reg_m=[1.0, 100.0], div
 def pretrain_growth_model(
     model: GrowthRateModel, 
     dataset: TimeSeriesDataset, 
-    uot_masses: List[torch.Tensor], 
+    uot_masses: List[torch.Tensor],
     num_epochs: int = 50, 
     learning_rate: float = 1e-3, 
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    scheduler_type: str = None,  # 'step', 'exponential', 'cosine', or None
+    scheduler_step_size: int = 30,  # For StepLR
+    scheduler_gamma: float = 0.5,  # Decay factor for schedulers
+    scheduler_t_max: int = None,  # For CosineAnnealingLR, defaults to num_epochs
+    scheduler_min_lr: float = 0.0   # Minimum learning rate for cosine scheduler
 ):
     """
     Pretrains the GrowthRateModel using MSE loss to match the UOT computed masses.
     """
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # Create learning rate scheduler if specified
+    scheduler = None
+    if scheduler_type == 'step':
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma)
+    elif scheduler_type == 'exponential':
+        scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=scheduler_gamma)
+    elif scheduler_type == 'cosine':
+        t_max = scheduler_t_max if scheduler_t_max is not None else num_epochs
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=scheduler_min_lr)
+
     criterion = nn.MSELoss()
     
     model.train()
@@ -415,7 +450,15 @@ def pretrain_growth_model(
         loss.backward()
         optimizer.step()
         
-        pbar.set_postfix({'MSE': f'{loss.item():.4f}'})
+        # Step the scheduler if specified
+        if scheduler is not None:
+            scheduler.step()
+        
+        postfix_dict = {'MSE': f'{loss.item():.4f}'}
+        if scheduler is not None:
+            postfix_dict['LR'] = f'{optimizer.param_groups[0]["lr"]:.2e}'
+            
+        pbar.set_postfix(postfix_dict)
 
 
 def train_mioflow(
@@ -542,20 +585,20 @@ def train_mioflow(
             density_loss_val = torch.tensor(0.0, device=device)
             energy_loss_val = torch.tensor(0.0, device=device)
 
+            source_mass = None
+            if growth_rate_model is not None:
+                if getattr(growth_rate_model, 'use_time', False):
+                    t_tensor = torch.tensor([t_start], device=device, dtype=torch.float32)
+                    source_mass = growth_rate_model(X_start, t_tensor)
+                else:
+                    source_mass = growth_rate_model(X_start)
+
             if lambda_ot > 0:
-                source_mass = None
-                if growth_rate_model is not None:
-                    if getattr(growth_rate_model, 'use_time', False):
-                        t_tensor = torch.tensor([t_start], device=device, dtype=torch.float32)
-                        source_mass = growth_rate_model(X_start, t_tensor)
-                    else:
-                        source_mass = growth_rate_model(X_start)
-                
                 ot_loss_val = ot_loss(X_pred, X_end, source_mass=source_mass)
                 total_loss += lambda_ot * ot_loss_val
                     
             if lambda_density > 0:
-                density_loss_val = density_loss(X_pred, X_end)
+                density_loss_val = density_loss(X_pred, X_end, source_mass=source_mass)
                 total_loss += lambda_density * density_loss_val
 
             if lambda_energy > 0:
