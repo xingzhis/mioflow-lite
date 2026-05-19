@@ -482,7 +482,9 @@ def train_mioflow(
     scheduler_t_max: int = None,  # For CosineAnnealingLR, defaults to num_epochs
     scheduler_min_lr: float = 0.0,  # Minimum learning rate for cosine scheduler
     growth_rate_model = None,  # Growth rate model
-    growth_rate_lr: float = 1e-4  # Learning rate for growth rate model
+    growth_rate_lr: float = 1e-4,  # Learning rate for growth rate model
+    lambda_ot_per_interval: list = None,  # Per-interval OT weights; overrides lambda_ot when set
+    lambda_energy_per_interval: list = None,  # Per-interval energy weights; overrides lambda_energy when set
 ) -> Dict:
     """
     Train MIOFlow model with ODE or SDE.
@@ -494,9 +496,11 @@ def train_mioflow(
         batch_size: Number of points to sample per time step (None = use all)
         learning_rate: Learning rate
         device: Device to train on
-        lambda_ot: Weight for OT loss
+        lambda_ot: Default weight for OT loss (used when lambda_ot_per_interval is None)
+        lambda_ot_per_interval: Per-interval OT weights list (length = number of intervals). Overrides lambda_ot.
         lambda_density: Weight for density loss
-        lambda_energy: Weight for energy regularization
+        lambda_energy: Default weight for energy regularization (used when lambda_energy_per_interval is None)
+        lambda_energy_per_interval: Per-interval energy weights list (length = number of intervals). Overrides lambda_energy.
         lambda_energy_f: Weight for drift energy (SDE only, default 1.0)
         lambda_energy_g: Weight for diffusion energy (SDE only, default 0.0)
         energy_time_steps: Number of time steps for energy evaluation
@@ -593,20 +597,30 @@ def train_mioflow(
                 else:
                     source_mass = growth_rate_model(X_start)
 
-            if lambda_ot > 0:
+            effective_lambda_ot = (
+                lambda_ot_per_interval[interval_idx]
+                if lambda_ot_per_interval is not None
+                else lambda_ot
+            )
+            if effective_lambda_ot > 0:
                 ot_loss_val = ot_loss(X_pred, X_end, source_mass=source_mass)
-                total_loss += lambda_ot * ot_loss_val
+                total_loss += effective_lambda_ot * ot_loss_val
                     
             if lambda_density > 0:
                 density_loss_val = density_loss(X_pred, X_end, source_mass=source_mass)
                 total_loss += lambda_density * density_loss_val
 
-            if lambda_energy > 0:
+            effective_lambda_energy = (
+                lambda_energy_per_interval[interval_idx]
+                if lambda_energy_per_interval is not None
+                else lambda_energy
+            )
+            if effective_lambda_energy > 0:
                 # Create denser time grid for energy loss
                 energy_t_seq = torch.linspace(t_start, t_end, energy_time_steps, device=device, dtype=torch.float32)
                 energy_loss_val = energy_loss(model, X_start, energy_t_seq, is_sde=is_sde, dt=sde_dt, 
                                              lambda_f=lambda_energy_f, lambda_g=lambda_energy_g)
-                total_loss += lambda_energy * energy_loss_val
+                total_loss += effective_lambda_energy * energy_loss_val
 
             # Optimize
             optimizer.zero_grad()
@@ -656,4 +670,3 @@ def train_mioflow(
         epoch_pbar.set_postfix(postfix_dict)
 
     return history
-
