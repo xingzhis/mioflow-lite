@@ -7,6 +7,7 @@ __pycache__/
 MIOFlow
 data/
 external/
+demos/outputs/
 *.pkl
 *.pt
 *.npy
