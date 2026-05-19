@@ -4,3 +4,10 @@ old/
 __pycache__/
 *.old
 *.csv
+MIOFlow
+data/
+external/
+*.pkl
+*.pt
+*.npy
+*.png
